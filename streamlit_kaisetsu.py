@@ -302,7 +302,24 @@ def main():
                 st.info(f'問{q_num} を検出しました')
 
                 if 'AI' in mode:
-                    question_text = '\n'.join(p.text for p in doc.paragraphs[:22] if p.text.strip())
+                    # 問題文のみ抽出（解説プレースホルダーは除外）
+                    exp_pat2 = re.compile(r'^[１２３４５][\s　]')
+                    lines = []
+                    for p in doc.paragraphs:
+                        t = p.text.strip()
+                        if not t: continue
+                        # 選択肢解説行とプレースホルダーを除外
+                        if exp_pat2.match(t): continue
+                        if '解答' in t and t.startswith('問'): continue
+                        lines.append(t)
+                    # 表を整形して追加
+                    for table in doc.tables:
+                        lines.append('')
+                        for row in table.rows:
+                            cells = [c.text.replace('\n', ' ').strip() for c in row.cells]
+                            if any(cells):
+                                lines.append(' | '.join(cells))
+                    question_text = '\n'.join(lines)
                     st.info('Claude API で解説生成中...')
                     # ファイルを再読み込み（上でread()済みのため）
                     uploaded.seek(0)
