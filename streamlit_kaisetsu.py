@@ -95,7 +95,7 @@ def extract_info(doc):
         t = p.text.strip()
         if exp_pat.match(p.text): info['explanation_para_idxs'].append(i)
         q = info['question_num']
-        if '解答' in t and q and q in t: info['answer_para_idx'] = i
+        if '解答' in t and t.startswith('問'): info['answer_para_idx'] = i
     if info['explanation_para_idxs']:
         first = info['explanation_para_idxs'][0]
         for i in range(first-1, max(0, first-5), -1):
