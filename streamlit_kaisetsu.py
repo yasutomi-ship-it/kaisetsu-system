@@ -255,6 +255,132 @@ def write_to_doc(doc, info, expl):
     write_all(doc, [block], [expl])
 
 
+# ──────────────────────────────────────────────
+# 社内フォーマット対応：問題本文から小問を自動検出し、
+# 解説を実番号で再生成する（雛形ライブラリはそのまま入っていてよい）
+# ──────────────────────────────────────────────
+NEG_MARKERS = ('誤っているのはどれか', '正しくないのはどれか', '適切でないのはどれか',
+               '適切でないもの', '含まれないのはどれか', '該当しないのはどれか',
+               'ないのはどれか')
+# 雛形（プレースホルダ）セクションの開始を示す目印
+TEMPLATE_MARKERS = ('解説（一括', 'ひな型', '雛形', '否定文用', '否定文ひな型',
+                    '連問の場合')
+
+
+def _set_ind(p, **kw):
+    pPr = p._element.get_or_add_pPr()
+    ind = pPr.find(qn('w:ind'))
+    if ind is None:
+        ind = OxmlElement('w:ind'); pPr.append(ind)
+    for k, v in kw.items():
+        ind.set(qn('w:' + k), str(v))
+
+
+def parse_question_blocks(doc):
+    """問題本文から実際の小問を抽出する。
+    返り値: (subs, boundary)
+      subs = [{'num','subject','n_choices','neg'}...]（問題文に現れる順）
+      boundary = 雛形（プレースホルダ）が始まる段落index。これ以降は解説再生成時に削除する。
+    """
+    paras = doc.paragraphs
+    boundary = len(paras)
+    for i, p in enumerate(paras):
+        t = p.text.strip()
+        if not t:
+            continue
+        if any(mk in t for mk in TEMPLATE_MARKERS) or EXP_PAT.match(t) or _is_answer_line(t):
+            boundary = i
+            break
+
+    # 小問ヘッダー（boundaryより前の「問\d+…」。範囲タイトル「問A〜B」は除外）
+    header_idxs = []
+    for i in range(boundary):
+        t = paras[i].text.strip()
+        if re.match(r'^問\d+', t) and '〜' not in t and '～' not in t and '解答' not in t:
+            header_idxs.append(i)
+
+    subs = []
+    for k, hi in enumerate(header_idxs):
+        t = paras[hi].text.strip()
+        num = re.match(r'^問(\d+)', t).group(1)
+        sm = re.match(r'^問\d+（([^）]*)）', t)
+        subject = sm.group(1) if sm else None
+        end = header_idxs[k + 1] if k + 1 < len(header_idxs) else boundary
+        seg_text = '\n'.join(paras[j].text for j in range(hi, end))
+        n_choices = len(re.findall(r'[１２３４５６]　', seg_text))
+        if n_choices == 0:
+            n_choices = 5
+        neg = any(mk in seg_text for mk in NEG_MARKERS)
+        subs.append({'num': num, 'subject': subject,
+                     'n_choices': n_choices, 'neg': neg})
+    return subs, boundary
+
+
+def delete_from(doc, boundary):
+    """boundary以降の段落をすべて削除（雛形ライブラリの除去）。"""
+    for p in list(doc.paragraphs)[boundary:]:
+        if p._p.getparent() is not None:
+            p._p.getparent().remove(p._p)
+
+
+def append_explanation(doc, sub, expl, add_header=True):
+    """問題本文の後ろに、実番号で書式付きの解説ブロックを追加する。
+    書式は社内フォーマット（前文1字下げ／選択肢ぶら下げ／解答は右揃え太字）に準拠。"""
+    doc.add_paragraph()  # 区切りの空行
+    if add_header:
+        p = doc.add_paragraph()
+        p._p.append(make_run('問', font=GOTHIC, bold=True))
+        p._p.append(make_run(str(sub.get('num', '000')), font=GOTHIC, bold=True))
+        if sub.get('subject'):
+            p._p.append(make_run('（' + sub['subject'] + '）', font=GOTHIC))
+
+    # 前文（あれば）
+    前文 = expl.get('前文', '')
+    if 前文:
+        p = doc.add_paragraph()
+        add_runs(p._p, parse_markup(前文))
+        _set_ind(p, firstLineChars=100, firstLine=180)
+        for line in expl.get('前文_追加行', []):
+            if not line:
+                continue
+            p = doc.add_paragraph()
+            add_runs(p._p, parse_markup(line))
+            _set_ind(p, firstLineChars=100, firstLine=180)
+    doc.add_paragraph()  # 前文と選択肢の間の空行
+
+    # 選択肢解説（ぶら下げインデント）
+    for item in expl.get('選択肢解説', []):
+        p = doc.add_paragraph()
+        p._p.append(make_run(item.get('番号', ''), font=GOTHIC))
+        p._p.append(make_run('　', font=HIRAGINO))
+        p._p.append(make_run(item.get('正誤', '誤') + '：'))
+        add_runs(p._p, parse_markup(item.get('内容', '')))
+        _set_ind(p, leftChars=100, left=720, hangingChars=300, hanging=540)
+
+    doc.add_paragraph()  # 選択肢と解答の間の空行
+
+    # 解答（右揃え・太字）
+    p = doc.add_paragraph()
+    for seg in ['問', str(sub.get('num', '000')), '　解答　']:
+        p._p.append(make_run(seg, font=GOTHIC, bold=True))
+    ans = expl.get('解答', [])
+    for i, a in enumerate(ans):
+        p._p.append(make_run(a, font=GOTHIC, bold=True))
+        if i < len(ans) - 1:
+            p._p.append(make_run('、', font=GOTHIC, bold=True))
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+
+def regenerate_explanations(doc, subs, boundary, expls):
+    """雛形を削除し、問題本文の後ろに実番号で解説を再生成する。
+    連問（複数小問）のときだけ各解説ブロックに問番号ヘッダーを付ける
+    （単問は従来フォーマットどおりヘッダーなし）。"""
+    delete_from(doc, boundary)
+    add_header = len(subs) > 1
+    for sub, expl in zip(subs, expls):
+        append_explanation(doc, sub, expl, add_header=add_header)
+
+
 SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家です。
 以下のJSON形式のみで回答してください（他のテキスト不要）:
 {
@@ -503,35 +629,23 @@ def main():
         with st.spinner('処理中...'):
             try:
                 doc = Document(io.BytesIO(uploaded.read()))
-                blocks = segment_questions(doc)
+                # 問題本文から実際の小問を自動検出（社内フォーマットの雛形はそのままでよい）
+                subs, boundary = parse_question_blocks(doc)
 
-                if not blocks:
-                    st.error('テンプレートの構造が読み取れませんでした。ファイルを確認してください。')
+                if not subs:
+                    st.error('問題文から小問（問◯◯）を検出できませんでした。ファイルを確認してください。')
                     st.stop()
 
-                is_renmon = len(blocks) > 1
-                q_labels = '・'.join(f"問{b['question_num']}" for b in blocks)
+                is_renmon = len(subs) > 1
+                q_labels = '・'.join(f"問{s['num']}" for s in subs)
                 if is_renmon:
-                    st.info(f'連問を検出しました（{q_labels}／{len(blocks)}問）')
+                    st.info(f'連問を検出しました（{q_labels}／{len(subs)}問）')
                 else:
-                    st.info(f'問{blocks[0]["question_num"]} を検出しました')
+                    st.info(f'問{subs[0]["num"]} を検出しました')
 
                 if 'AI' in mode:
-                    # 問題文のみ抽出（解説プレースホルダー・解答行は除外）
-                    exp_pat2 = re.compile(r'^[１２３４５][\s　](誤|正)：')
-                    lines = []
-                    for p in doc.paragraphs:
-                        t = p.text.strip()
-                        if not t:
-                            continue
-                        if exp_pat2.match(t):
-                            continue
-                        if _is_answer_line(t):
-                            continue
-                        # 雛形プレースホルダ（「ああ」「ひな型」等）を除外
-                        if 'ひな型' in t or ('解説（' in t and 'ああ' in t):
-                            continue
-                        lines.append(t)
+                    # 問題本文のみ抽出（boundary=雛形開始より前）＋表
+                    lines = [p.text.strip() for p in doc.paragraphs[:boundary] if p.text.strip()]
                     for table in doc.tables:
                         lines.append('')
                         for row in table.rows:
@@ -541,13 +655,8 @@ def main():
                     question_text = '\n'.join(lines)
 
                     st.info('Claude API で解説生成中...')
-                    uploaded.seek(0)
-                    doc = Document(io.BytesIO(uploaded.read()))
-                    blocks = segment_questions(doc)
-
-                    sub_meta = [{'番号': b['question_num'], '科目': b.get('subject'),
-                                 '選択肢数': len(b['explanation_para_idxs'])}
-                                for b in blocks]
+                    sub_meta = [{'番号': s['num'], '科目': s.get('subject'),
+                                 '選択肢数': s.get('n_choices', 5)} for s in subs]
                     result = call_api(question_text, api_key,
                                       sub_questions=sub_meta if is_renmon else None)
 
@@ -557,8 +666,8 @@ def main():
                             raise ValueError('連問形式の応答が得られませんでした。')
                         by_num = {str(it.get('問番号')): it for it in items}
                         expls = []
-                        for i, b in enumerate(blocks):
-                            it = by_num.get(str(b['question_num']))
+                        for i, s in enumerate(subs):
+                            it = by_num.get(str(s['num']))
                             if it is None:
                                 it = items[i] if i < len(items) else {}
                             expls.append(it)
@@ -570,7 +679,8 @@ def main():
                         st.stop()
                     expls = [explanation]
 
-                write_all(doc, blocks, expls)
+                # 雛形を削除し、実番号で解説ブロックを再生成
+                regenerate_explanations(doc, subs, boundary, expls)
 
                 # docxをメモリに保存
                 buf = io.BytesIO()
@@ -579,8 +689,8 @@ def main():
 
                 fname = uploaded.name.replace('.docx', '_完成.docx')
                 ans_str = ' ／ '.join(
-                    f"問{b['question_num']}: " + '、'.join(e.get('解答', []))
-                    for b, e in zip(blocks, expls))
+                    f"問{s['num']}: " + '、'.join(e.get('解答', []))
+                    for s, e in zip(subs, expls))
 
                 st.success(f'✅ 完成！（解答 → {ans_str}）')
 
