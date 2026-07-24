@@ -13,6 +13,7 @@ import urllib.error
 from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # ──────────────────────────────────────────────
 # フォーマットエンジン
@@ -25,11 +26,24 @@ MARKUP   = re.compile(r'\{\{([^}]+)\}\}')
 NUMBERS  = ['１', '２', '３', '４', '５']
 
 
+_DASH_CHARS = ('-', '−', '‐', '‑', '–', '—',
+               '－')  # 半角ハイフン/数学マイナス/各種ハイフン・ダッシュ/全角
+
+
+def normalize_dashes(text):
+    """連結記号・マイナスを全角ハイフンマイナス「－」（U+FF0D）に統一する。
+    半角ハイフン・数学マイナス(U+2212)・各種ダッシュを吸収し、
+    フォントが周囲と揃うようにする。"""
+    for ch in _DASH_CHARS:
+        text = text.replace(ch, '－')
+    return text
+
+
 def parse_markup(text):
     runs, pos = [], 0
     for m in MARKUP.finditer(text):
         if m.start() > pos:
-            runs.append({'text': text[pos:m.start()]})
+            runs.append({'text': normalize_dashes(text[pos:m.start()])})
         c = m.group(1)
         if   c == '-':           runs.append({'text': '－'})
         elif c == 'mu':          runs.append({'text': 'µ',  'font': CENTURY, 'italic': True})
@@ -45,7 +59,7 @@ def parse_markup(text):
             if ':' in c: runs.append({'text':c.split(':',1)[1],'sub':True})
         else: runs.append({'text': c})
         pos = m.end()
-    if pos < len(text): runs.append({'text': text[pos:]})
+    if pos < len(text): runs.append({'text': normalize_dashes(text[pos:])})
     return runs
 
 
@@ -83,70 +97,162 @@ def clear_runs(para):
     for r in para._p.findall(qn('w:r')): para._p.remove(r)
 
 
-def extract_info(doc):
-    info = {'question_num': None, 'preamble_para_idx': None,
-            'explanation_para_idxs': [], 'answer_para_idx': None}
+EXP_PAT = re.compile(r'^[１２３４５]　(誤|正)：')
+HEAD_PAT = re.compile(r'^問\s*(\d+)\s*(?:（([^）]*)）)?')
+
+
+def _is_answer_line(text):
+    t = text.strip()
+    return t.startswith('問') and '解答' in t
+
+
+def segment_questions(doc):
+    """テンプレートを小問ブロックに分割する。
+    連問（問196以降）は複数の解答行を持つため、解答行を区切りとしてブロック化する。
+    各ブロック: 問番号・科目・前文プレースホルダ・選択肢解説プレースホルダ・解答行。
+    単問の場合は要素1つのリストを返す。"""
     paras = doc.paragraphs
-    exp_pat = re.compile(r'^[１２３４５]　(誤|正)：')
-    for p in paras:
-        m = re.match(r'問(\d+)', p.text)
-        if m: info['question_num'] = m.group(1); break
-    for i, p in enumerate(paras):
-        t = p.text.strip()
-        if exp_pat.match(p.text): info['explanation_para_idxs'].append(i)
-        q = info['question_num']
-        if '解答' in t and t.startswith('問'): info['answer_para_idx'] = i
-    if info['explanation_para_idxs']:
-        first = info['explanation_para_idxs'][0]
-        for i in range(first-1, max(0, first-5), -1):
+    ans_idxs = [i for i, p in enumerate(paras) if _is_answer_line(p.text)]
+    blocks = []
+    prev = -1
+    for ai in ans_idxs:
+        exps = [i for i in range(prev + 1, ai) if EXP_PAT.match(paras[i].text)]
+        if not exps:
+            prev = ai
+            continue
+        first = exps[0]
+        # ブロック内の問番号ヘッダー（問NNN（科目））
+        header_idx, qnum, subject = None, None, None
+        for i in range(first - 1, prev, -1):
             t = paras[i].text.strip()
-            if t and not t.startswith('問') and '解答' not in t:
-                info['preamble_para_idx'] = i; break
-    return info
+            if t.startswith('問') and '解答' not in t:
+                m = HEAD_PAT.match(t)
+                if m:
+                    header_idx, qnum, subject = i, m.group(1), m.group(2)
+                    break
+        # 解答行からも問番号を補完
+        if qnum is None:
+            m = HEAD_PAT.match(paras[ai].text.strip())
+            if m:
+                qnum = m.group(1)
+        # 前文プレースホルダ（選択肢解説の直前・非空・番号始まりでない段落）
+        pre_idx = None
+        for i in range(first - 1, (header_idx if header_idx is not None else prev), -1):
+            t = paras[i].text.strip()
+            if not t:
+                continue
+            if EXP_PAT.match(paras[i].text):
+                continue
+            if t[0] in '１２３４５' or t.startswith('問') or '解答' in t:
+                break  # 実際の選択肢・見出しに到達 → 前文なし
+            pre_idx = i
+            break
+        blocks.append({
+            'question_num': qnum, 'subject': subject,
+            'header_para_idx': header_idx, 'preamble_para_idx': pre_idx,
+            'explanation_para_idxs': exps, 'answer_para_idx': ai,
+        })
+        prev = ai
+    return blocks
+
+
+def extract_info(doc):
+    """後方互換: 最初の小問ブロックを単問形式で返す。"""
+    blocks = segment_questions(doc)
+    if not blocks:
+        return {'question_num': None, 'preamble_para_idx': None,
+                'explanation_para_idxs': [], 'answer_para_idx': None}
+    b = blocks[0]
+    return {'question_num': b['question_num'],
+            'preamble_para_idx': b['preamble_para_idx'],
+            'explanation_para_idxs': b['explanation_para_idxs'],
+            'answer_para_idx': b['answer_para_idx']}
+
+
+def _write_header(p, qnum, subject):
+    """問番号ヘッダーを問題側と統一（問＋番号をボールド、ＭＳゴシック）。"""
+    clear_runs(p)
+    p._p.append(make_run('問', font=GOTHIC, bold=True))
+    p._p.append(make_run(str(qnum or '000'), font=GOTHIC, bold=True))
+    if subject:
+        p._p.append(make_run('（' + subject + '）', font=GOTHIC))
+
+
+def write_block(doc, block, expl):
+    """1つの小問ブロックに前文・選択肢解説・解答を書き込む（削除はしない）。"""
+    paras = doc.paragraphs
+    # ヘッダー（「問N（科目）」形式の短い見出しのみ、問番号をボールド化して統一）
+    # 問題文の設問行（長文）を誤って書き換えないよう文字数でガードする
+    if block.get('header_para_idx') is not None:
+        hp = paras[block['header_para_idx']]
+        if len(hp.text.strip()) <= 12 and re.match(r'^問\d+', hp.text.strip()):
+            _write_header(hp, block.get('question_num'), block.get('subject'))
+
+    # 選択肢解説
+    for idx, item in zip(block['explanation_para_idxs'], expl.get('選択肢解説', [])):
+        p = paras[idx]
+        clear_runs(p)
+        p._p.append(make_run('', font=GOTHIC, bold=True))
+        p._p.append(make_run(item.get('番号', ''), font=GOTHIC))
+        p._p.append(make_run('　', font=HIRAGINO))
+        p._p.append(make_run(item.get('正誤', '誤') + '：'))
+        add_runs(p._p, parse_markup(item.get('内容', '')))
+
+    # 解答行（右揃え・全体ボールド）
+    p_ans = paras[block['answer_para_idx']]
+    clear_runs(p_ans)
+    p_ans.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    q = block.get('question_num', '000')
+    for seg in ['問', str(q), '　', '解答　']:
+        p_ans._p.append(make_run(seg, font=GOTHIC, bold=True))
+    for i, ans in enumerate(expl.get('解答', [])):
+        p_ans._p.append(make_run(ans, font=GOTHIC, bold=True))
+        if i < len(expl['解答']) - 1:
+            p_ans._p.append(make_run('、', font=GOTHIC, bold=True))
+
+    # 前文
+    if block.get('preamble_para_idx') is not None:
+        p_pre = paras[block['preamble_para_idx']]
+        clear_runs(p_pre)
+        前文 = expl.get('前文', '')
+        add_runs(p_pre._p, parse_markup(前文) if 前文 else [{'text': ''}])
+        pPr = p_pre._p.find(qn('w:pPr'))
+        last = p_pre._p
+        for line in expl.get('前文_追加行', []):
+            np = OxmlElement('w:p')
+            if pPr is not None:
+                np.append(copy.deepcopy(pPr))
+            last.addnext(np)
+            add_runs(np, parse_markup(line))
+            last = np
+
+
+def write_all(doc, blocks, expls):
+    """全ブロックを書き込み、最後の解答行より後ろのテンプレート雛形を削除する。"""
+    # 末尾雛形の削除（最後の解答行以降）
+    last_ans = doc.paragraphs[blocks[-1]['answer_para_idx']]._p
+    del_elems, found = [], False
+    for p in doc.paragraphs:
+        if found:
+            del_elems.append(p._p)
+        if p._p is last_ans:
+            found = True
+    # 書き込みは段落インデックスに依存するため、削除より前に実施
+    for block, expl in zip(blocks, expls):
+        write_block(doc, block, expl)
+    for e in del_elems:
+        if e.getparent() is not None:
+            e.getparent().remove(e)
 
 
 def write_to_doc(doc, info, expl):
-    paras = doc.paragraphs
-    p_pre  = paras[info['preamble_para_idx']] if info['preamble_para_idx'] is not None else None
-    p_exps = [paras[i] for i in info['explanation_para_idxs']]
-    p_ans  = paras[info['answer_para_idx']]
-
-    del_elems = []
-    found = False
-    for p in paras:
-        if found: del_elems.append(p._p)
-        if p is p_ans: found = True
-
-    for p, item in zip(p_exps, expl.get('選択肢解説',[])):
-        clear_runs(p)
-        p._p.append(make_run('', font=GOTHIC, bold=True))
-        p._p.append(make_run(item.get('番号',''), font=GOTHIC))
-        p._p.append(make_run('　', font=HIRAGINO))
-        p._p.append(make_run(item.get('正誤','誤') + '：'))
-        add_runs(p._p, parse_markup(item.get('内容','')))
-
-    clear_runs(p_ans)
-    q = info.get('question_num','000')
-    for seg in [('問',True),(q,True),('　',True),('解答　',True)]:
-        p_ans._p.append(make_run(seg[0], font=GOTHIC, bold=seg[1]))
-    for i, ans in enumerate(expl.get('解答',[])):
-        p_ans._p.append(make_run(ans, font=GOTHIC, bold=True))
-        if i < len(expl['解答'])-1:
-            p_ans._p.append(make_run('、', font=GOTHIC, bold=True))
-
-    if p_pre:
-        clear_runs(p_pre)
-        前文 = expl.get('前文','')
-        add_runs(p_pre._p, parse_markup(前文) if 前文 else [{'text':''}])
-        pPr = p_pre._p.find(qn('w:pPr'))
-        last = p_pre._p
-        for line in expl.get('前文_追加行',[]):
-            np = OxmlElement('w:p')
-            if pPr is not None: np.append(copy.deepcopy(pPr))
-            last.addnext(np); add_runs(np, parse_markup(line)); last = np
-
-    for e in del_elems:
-        if e.getparent() is not None: e.getparent().remove(e)
+    """後方互換: 単問1つ分を書き込む。"""
+    block = {'question_num': info.get('question_num'), 'subject': None,
+             'header_para_idx': None,
+             'preamble_para_idx': info.get('preamble_para_idx'),
+             'explanation_para_idxs': info['explanation_para_idxs'],
+             'answer_para_idx': info['answer_para_idx']}
+    write_all(doc, [block], [expl])
 
 
 SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家です。
@@ -174,8 +280,9 @@ SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家�
 - 計算は数値を具体的に示し、途中式を省略しない。
 
 【記号・表記の統一ルール】
-- ハイフンとマイナス：数式・モデル名には「−」（全角マイナス）を使用。「1−コンパートメントモデル」（「1-コンパートメント」のように半角ハイフンは使わない）
-- 引き算の記号はすべて「−」（全角マイナス）。例：50−30＝20
+- ハイフンとマイナス：数式・モデル名・化合物名・略号内の連結記号にはすべて「－」（全角ハイフンマイナス、U+FF0D）を使用し、半角ハイフン「-」は一切使わない。
+  例：「1－コンパートメントモデル」「P－糖タンパク質」「P－gp」「UDP－グルクロン酸転移酵素」「L－カルボシステイン」「α－ヘリックス」（「1-」「P-」のような半角ハイフンは禁止）
+- 引き算の記号はすべて「－」（全角マイナス）。例：50－30＝20
 - クリアランスの区別：
   ・CL = 全身クリアランス（肝・腎などをすべて含む）
   ・CLr = 腎クリアランス（renal clearance）
@@ -192,14 +299,14 @@ SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家�
 - 投与間隔：τ
 - 平均滞留時間：MRT、平均吸収時間：MAT、平均溶出時間：MDT
 - 式番号：①②③…を用いて文中で相互参照
-- 単位：h、L、mg、h－1（上付き−1）など
+- 単位：h、L、mg、h－1（上付き－1）など
 
 【良い解説の例①：薬剤（薬物動態）知識問題（第110回 問173）】
 正解：３、５
 前文：「薬物の尿中排泄は、糸球体におけるろ過、尿細管における分泌、再吸収という三つの過程によって行われる。血液中に含まれる薬物のうちタンパクと結合していない非結合形の薬物が糸球体でろ過を受ける。次に、近位尿細管においてトランスポーター等によって認識される薬物は分泌を受け、尿細管に流入する。その後、尿細管内に流入した薬物のうち再吸収を受けなかった薬物が尿中に排泄される。このうち、糸球体ろ過における単位時間あたりの血漿のろ過量を糸球体ろ過速度（GFR）といい、通常成人では約100 mL/min/1.73 m2である。ろ過クリアランスは、GFR×fp（fp：血漿タンパク非結合率）で表される。イヌリンは血漿タンパクと結合せず（fp=1）、尿細管分泌や再吸収を受けないため、イヌリンクリアランス＝GFRとなる。一方、クレアチニンは尿細管において若干の分泌を受けるため、クレアチニンクリアランス＞GFRとなる。」
 選択肢１：「誤：GFR＝イヌリンクリアランス＝30 mL/min/1.73 m2と推定できる。」
 選択肢２：「誤：イヌリンは尿細管で分泌・再吸収を受けないため、再吸収クリアランスは存在しない。」
-選択肢３：「正：クレアチニンの尿細管分泌クリアランス＝クレアチニンクリアランス−イヌリンクリアランス＝50−30＝20 mL/min/1.73 m2と推定できる。」
+選択肢３：「正：クレアチニンの尿細管分泌クリアランス＝クレアチニンクリアランス－イヌリンクリアランス＝50－30＝20 mL/min/1.73 m2と推定できる。」
 選択肢４：「誤：正常成人のGFRは約100 mL/min/1.73 m2であるため、本患者のイヌリンクリアランス30 mL/min/1.73 m2は正常時より小さいと考えられる。」
 選択肢５：「正：本患者のクレアチニンクリアランス50 mL/min/1.73 m2は正常時（約100 mL/min/1.73 m2）より小さいと考えられる。」
 
@@ -207,7 +314,7 @@ SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家�
 正解：１、５
 前文：「」（純粋知識問題のため前文なし）
 選択肢１：「正：オキシメテバノールは麻薬性鎮咳薬であり、オピオイド受容体を刺激して鎮咳作用を示す。」
-選択肢２：「誤：L−カルボシステインは構造中にSH基を有さず、ムコタンパク質の構成成分であるシアル酸・フコースのバランスを改善して去痰作用を示す。なお、SH基を有しムコタンパク質のペプチド鎖の連結を切断して去痰作用を示す薬剤はアセチルシステインである。」
+選択肢２：「誤：L－カルボシステインは構造中にSH基を有さず、ムコタンパク質の構成成分であるシアル酸・フコースのバランスを改善して去痰作用を示す。なお、SH基を有しムコタンパク質のペプチド鎖の連結を切断して去痰作用を示す薬剤はアセチルシステインである。」
 選択肢３：「誤：フルマゼニルはベンゾジアゼピン受容体に結合し、ベンゾジアゼピン系薬の作用に拮抗することで呼吸抑制を改善する。なお、末梢性化学受容器を刺激して間接的に呼吸中枢を興奮させる薬剤はドキサプラムである。」
 選択肢４：「誤：アンブロキソールはブロムヘキシンの活性代謝物であり、肺サーファクタント分泌の促進・線毛運動の亢進により去痰作用を示す。（本選択肢は親薬物と活性代謝物が逆）」
 選択肢５：「正：ニンテダニブは低分子チロシンキナーゼ阻害薬であり、VEGFR・FGFR・PDGFRのチロシンキナーゼを阻害して肺の線維化を抑制する。」
@@ -215,7 +322,7 @@ SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家�
 【良い解説の例③：生化学知識問題（第110回 問115）】
 正解：２、３
 前文：「」（純粋知識問題のため前文なし）
-選択肢１：「誤：α−ヘリックスとは1本のポリペプチド鎖が分子内水素結合することで形成される細長いらせん構造を指す。コラーゲンの三重らせん構造は3本のポリペプチド鎖が形成する特殊ならせん構造であり、α−ヘリックスとは異なる。」
+選択肢１：「誤：α－ヘリックスとは1本のポリペプチド鎖が分子内水素結合することで形成される細長いらせん構造を指す。コラーゲンの三重らせん構造は3本のポリペプチド鎖が形成する特殊ならせん構造であり、α－ヘリックスとは異なる。」
 選択肢２：「正：Xはプロリン（Pro）の翻訳後修飾で生じたアミノ酸であることから、ヒドロキシプロリンであると考えられる。」
 選択肢３：「正：グリシン（Gly）は側鎖が水素原子であるため空間を占める割合が小さく、コラーゲンの三重らせん構造における混み合った部位に安定して収まることができるため、三重らせん構造の形成に重要な役割を担う。」
 選択肢４：「誤：ビタミンCがコラーゲン遺伝子の転写を促進する際に核内に移行するかどうかは現在不明である。」
@@ -232,15 +339,53 @@ SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家�
 
 マークアップ（数式・変数名に使用）:
 {{CL:r}}=CLr {{f:e}}=fe {{K:sp}}=Ksp {{t:1/2}}=t1/2 {{Vd}}=Vd
-{{mu}}=µ {{-}}=全角マイナス（−） {{sup:2}}=上付き2"""
+{{mu}}=µ {{-}}=全角マイナス（－） {{sup:2}}=上付き2"""
 
 
-def call_api(question_text, api_key):
+RENMON_INSTRUCTION = """
+【連問（問196以降の実践問題）の指示】
+これは複数の小問が連続する「連問」である。以下の小問すべての解説を、必ず次のJSON形式（連問配列）のみで一括生成すること:
+{{
+  "連問": [
+    {{"問番号":"{first}", "前文":"...", "前文_追加行":[], "選択肢解説":[{{"番号":"１","正誤":"誤","内容":"..."}}, ...], "解答":["３"]}},
+    ...（小問の数だけ続ける）...
+  ]
+}}
+対象の小問（この順序・この問番号で出力すること）: {targets}
+- 連問は前の小問の内容を前提とする（例：「前問の処方提案の理由は〜」）。共有の症例・検査値・処方を踏まえ、各小問の整合性を保つこと。
+- 各小問の「選択肢解説」は、その小問の選択肢数に一致させること。
+- 「1つ選べ」の小問は解答を1つ、「2つ選べ」は2つ、という具合に設問の指示に従うこと。"""
+
+
+def _extract_json(text):
+    depth, start = 0, None
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                return json.loads(text[start:i + 1])
+    raise ValueError("JSONが見つかりません")
+
+
+def call_api(question_text, api_key, sub_questions=None):
+    """単問なら解説JSONを、連問なら {'連問':[...]} を返す。
+    sub_questions: 連問時の [{'番号':..,'科目':..,'選択肢数':..}] のリスト。"""
+    user_content = f"解説を生成してください:\n\n{question_text}"
+    if sub_questions and len(sub_questions) > 1:
+        targets = "、".join(
+            f"問{s['番号']}（{s.get('科目') or ''}・選択肢{s.get('選択肢数', 5)}）"
+            for s in sub_questions)
+        user_content += RENMON_INSTRUCTION.format(
+            first=sub_questions[0]['番号'], targets=targets)
     payload = {
         "model": "claude-opus-4-8",
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "system": SYSTEM_PROMPT,
-        "messages": [{"role":"user","content":f"解説を生成してください:\n\n{question_text}"}]
+        "messages": [{"role": "user", "content": user_content}]
     }
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -249,11 +394,9 @@ def call_api(question_text, api_key):
                  'x-api-key': api_key,
                  'anthropic-version':'2023-06-01'},
         method='POST')
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=180) as resp:
         text = json.loads(resp.read())['content'][0]['text']
-        m = re.search(r'\{[\s\S]+\}', text)
-        if m: return json.loads(m.group())
-        raise ValueError("JSONが見つかりません")
+        return _extract_json(text)
 
 
 # ──────────────────────────────────────────────
@@ -360,27 +503,35 @@ def main():
         with st.spinner('処理中...'):
             try:
                 doc = Document(io.BytesIO(uploaded.read()))
-                info = extract_info(doc)
-                q_num = info['question_num']
+                blocks = segment_questions(doc)
 
-                if not info['explanation_para_idxs'] or info['answer_para_idx'] is None:
+                if not blocks:
                     st.error('テンプレートの構造が読み取れませんでした。ファイルを確認してください。')
                     st.stop()
 
-                st.info(f'問{q_num} を検出しました')
+                is_renmon = len(blocks) > 1
+                q_labels = '・'.join(f"問{b['question_num']}" for b in blocks)
+                if is_renmon:
+                    st.info(f'連問を検出しました（{q_labels}／{len(blocks)}問）')
+                else:
+                    st.info(f'問{blocks[0]["question_num"]} を検出しました')
 
                 if 'AI' in mode:
-                    # 問題文のみ抽出（解説プレースホルダーは除外）
-                    exp_pat2 = re.compile(r'^[１２３４５][\s　]')
+                    # 問題文のみ抽出（解説プレースホルダー・解答行は除外）
+                    exp_pat2 = re.compile(r'^[１２３４５][\s　](誤|正)：')
                     lines = []
                     for p in doc.paragraphs:
                         t = p.text.strip()
-                        if not t: continue
-                        # 選択肢解説行とプレースホルダーを除外
-                        if exp_pat2.match(t): continue
-                        if '解答' in t and t.startswith('問'): continue
+                        if not t:
+                            continue
+                        if exp_pat2.match(t):
+                            continue
+                        if _is_answer_line(t):
+                            continue
+                        # 雛形プレースホルダ（「ああ」「ひな型」等）を除外
+                        if 'ひな型' in t or ('解説（' in t and 'ああ' in t):
+                            continue
                         lines.append(t)
-                    # 表を整形して追加
                     for table in doc.tables:
                         lines.append('')
                         for row in table.rows:
@@ -388,14 +539,38 @@ def main():
                             if any(cells):
                                 lines.append(' | '.join(cells))
                     question_text = '\n'.join(lines)
+
                     st.info('Claude API で解説生成中...')
-                    # ファイルを再読み込み（上でread()済みのため）
                     uploaded.seek(0)
                     doc = Document(io.BytesIO(uploaded.read()))
-                    info = extract_info(doc)
-                    explanation = call_api(question_text, api_key)
+                    blocks = segment_questions(doc)
 
-                write_to_doc(doc, info, explanation)
+                    sub_meta = [{'番号': b['question_num'], '科目': b.get('subject'),
+                                 '選択肢数': len(b['explanation_para_idxs'])}
+                                for b in blocks]
+                    result = call_api(question_text, api_key,
+                                      sub_questions=sub_meta if is_renmon else None)
+
+                    if is_renmon:
+                        items = result.get('連問', []) if isinstance(result, dict) else []
+                        if not items:
+                            raise ValueError('連問形式の応答が得られませんでした。')
+                        by_num = {str(it.get('問番号')): it for it in items}
+                        expls = []
+                        for i, b in enumerate(blocks):
+                            it = by_num.get(str(b['question_num']))
+                            if it is None:
+                                it = items[i] if i < len(items) else {}
+                            expls.append(it)
+                    else:
+                        expls = [result]
+                else:
+                    if is_renmon:
+                        st.error('連問は手動入力に未対応です。AIモードをご利用ください。')
+                        st.stop()
+                    expls = [explanation]
+
+                write_all(doc, blocks, expls)
 
                 # docxをメモリに保存
                 buf = io.BytesIO()
@@ -403,9 +578,11 @@ def main():
                 buf.seek(0)
 
                 fname = uploaded.name.replace('.docx', '_完成.docx')
-                ans_str = '、'.join(explanation.get('解答', []))
+                ans_str = ' ／ '.join(
+                    f"問{b['question_num']}: " + '、'.join(e.get('解答', []))
+                    for b, e in zip(blocks, expls))
 
-                st.success(f'✅ 完成！（解答: {ans_str}）')
+                st.success(f'✅ 完成！（解答 → {ans_str}）')
 
                 st.download_button(
                     label='📥 完成ファイルをダウンロード',
