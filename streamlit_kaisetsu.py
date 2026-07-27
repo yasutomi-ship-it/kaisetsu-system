@@ -14,6 +14,8 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.shared import Inches, Pt
 
 # ──────────────────────────────────────────────
 # フォーマットエンジン
@@ -39,28 +41,65 @@ def normalize_dashes(text):
     return text
 
 
+# {{...}}（特殊フォント用）、_{...}（下付き）、^{...}（上付き）を1つのトークナイザで処理
+TOKEN_RE = re.compile(r'(\{\{[^}]+\}\})|([_^])\{([^}]*)\}')
+
+
+def auto_scientific(text):
+    """上付き・下付きが markup 化されていない一般的な理系表記を _{ }/^{ } に自動変換する
+    （AIが markup を付け忘れた場合の保険）。"""
+    # 括弧付き指数 e^(-kt) → e^{-kt}
+    text = re.sub(r'\^\(([^)]*)\)', r'^{\1}', text)
+    # 10のべき乗：10－5 / 10-5 → 10^{-5}
+    text = re.sub(r'10[－\-−]([0-9]+)', r'10^{-\1}', text)
+    # 半減期・初期濃度など定番の下付き（薬学分野で一意）
+    text = text.replace('t1/2', 't_{1/2}')
+    text = re.sub(r'([AC])0(?![0-9])', r'\1_{0}', text)  # A0, C0
+    return text
+
+
+def _expand_curly(c):
+    """{{...}} トークン1つ分を runs に展開する。"""
+    if   c == '-':            return [{'text': '－'}]
+    elif c == 'mu':           return [{'text': 'µ', 'font': CENTURY, 'italic': True}]
+    elif c.startswith('sup:'): return [{'text': c[4:], 'sup': True}]
+    elif c.startswith('sub:'): return [{'text': c[4:], 'sub': True}]
+    elif c.startswith('CL:'):  return [{'text':'CL','font':TNR,'italic':True},{'text':c[3:],'sub':True}]
+    elif c == 'CL':           return [{'text':'CL','font':TNR,'italic':True}]
+    elif c.startswith('f:'):   return [{'text':'f','font':CENTURY,'italic':True},{'text':c[2:],'sub':True}]
+    elif c == 'f':            return [{'text':'f','font':CENTURY,'italic':True}]
+    elif c.startswith('K:'):   return [{'text':'K','font':CENTURY,'italic':True},{'text':c[2:],'sub':True}]
+    elif c.startswith('t:'):   return [{'text':'t','font':CENTURY,'italic':True},{'text':c[2:],'sub':True}]
+    elif 'Vd' in c:
+        r = [{'text':'Vd','font':CENTURY,'italic':True}]
+        if ':' in c: r.append({'text':c.split(':',1)[1],'sub':True})
+        return r
+    return [{'text': c}]
+
+
 def parse_markup(text):
+    text = auto_scientific(text)
     runs, pos = [], 0
-    for m in MARKUP.finditer(text):
+    for m in TOKEN_RE.finditer(text):
         if m.start() > pos:
             runs.append({'text': normalize_dashes(text[pos:m.start()])})
-        c = m.group(1)
-        if   c == '-':           runs.append({'text': '－'})
-        elif c == 'mu':          runs.append({'text': 'µ',  'font': CENTURY, 'italic': True})
-        elif c.startswith('sup:'): runs.append({'text': c[4:], 'sup': True})
-        elif c.startswith('CL:'): runs += [{'text':'CL','font':TNR,'italic':True},{'text':c[3:],'sub':True}]
-        elif c == 'CL':          runs.append({'text':'CL','font':TNR,'italic':True})
-        elif c.startswith('f:'): runs += [{'text':'f','font':CENTURY,'italic':True},{'text':c[2:],'sub':True}]
-        elif c == 'f':           runs.append({'text':'f','font':CENTURY,'italic':True})
-        elif c.startswith('K:'): runs += [{'text':'K','font':CENTURY,'italic':True},{'text':c[2:],'sub':True}]
-        elif c.startswith('t:'): runs += [{'text':'t','font':CENTURY,'italic':True},{'text':c[2:],'sub':True}]
-        elif 'Vd' in c:
-            runs.append({'text':'Vd','font':CENTURY,'italic':True})
-            if ':' in c: runs.append({'text':c.split(':',1)[1],'sub':True})
-        else: runs.append({'text': c})
+        if m.group(1):                       # {{...}}
+            runs += _expand_curly(m.group(1)[2:-2])
+        else:                                # _{...} / ^{...}
+            kind, inner = m.group(2), m.group(3)
+            runs.append({'text': inner, 'sub': kind == '_', 'sup': kind == '^'})
         pos = m.end()
-    if pos < len(text): runs.append({'text': normalize_dashes(text[pos:])})
+    if pos < len(text):
+        runs.append({'text': normalize_dashes(text[pos:])})
     return runs
+
+
+def split_bullets(text):
+    """「●」区切りの列挙を各行に分割する（前文で複数種を提示する場合に見やすくする）。"""
+    if '●' not in text:
+        return [text]
+    parts = re.split(r'(?=●)', text)
+    return [p.strip() for p in parts if p.strip()]
 
 
 def make_run(text, font=None, italic=False, bold=None, sub=False, sup=False):
@@ -323,6 +362,84 @@ def delete_from(doc, boundary):
             p._p.getparent().remove(p._p)
 
 
+def smiles_to_png(smiles, size=(260, 200)):
+    """SMILES から2D構造式のPNGバイト列を生成する。
+    RDKitが無い／SMILESが不正な場合は None を返す（機能はグレースフルにスキップ）。"""
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Draw
+        from rdkit.Chem.Draw import rdMolDraw2D
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+        drawer = rdMolDraw2D.MolDraw2DCairo(size[0], size[1])
+        opt = drawer.drawOptions()
+        opt.bondLineWidth = 2
+        drawer.DrawMolecule(mol)
+        drawer.FinishDrawing()
+        return io.BytesIO(drawer.GetDrawingText())
+    except Exception:
+        # Cairo が無い環境向けフォールバック
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import Draw
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return None
+            img = Draw.MolToImage(mol, size=size)
+            bio = io.BytesIO()
+            img.save(bio, format='PNG')
+            bio.seek(0)
+            return bio
+        except Exception:
+            return None
+
+
+def _clear_cell_borders(table):
+    """表の罫線を消して図版らしく見せる。"""
+    tbl = table._tbl
+    tblPr = tbl.tblPr
+    borders = OxmlElement('w:tblBorders')
+    for edge in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'):
+        e = OxmlElement('w:' + edge)
+        e.set(qn('w:val'), 'none')
+        borders.append(e)
+    tblPr.append(borders)
+
+
+def insert_structure_figure(doc, structures, per_row=3):
+    """構造式リスト（[{'ラベル','smiles'}...]）を、ラベル付き画像の図版として挿入する。
+    RDKit未導入・不正SMILESの項目は自動的にスキップする。"""
+    rendered = []
+    for s in structures or []:
+        if not isinstance(s, dict):
+            continue
+        smi = s.get('smiles') or s.get('SMILES')
+        if not smi:
+            continue
+        png = smiles_to_png(smi)
+        if png is not None:
+            rendered.append((s.get('ラベル', ''), png))
+    if not rendered:
+        return
+    n = len(rendered)
+    cols = min(per_row, n)
+    rows = (n + cols - 1) // cols
+    table = doc.add_table(rows=rows, cols=cols)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    _clear_cell_borders(table)
+    for idx, (label, png) in enumerate(rendered):
+        r, c = divmod(idx, cols)
+        cell = table.cell(r, c)
+        pimg = cell.paragraphs[0]
+        pimg.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        pimg.add_run().add_picture(png, width=Inches(1.7))
+        pcap = cell.add_paragraph()
+        pcap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        rr = pcap.add_run(label)
+        rr.font.size = Pt(9)
+
+
 def append_explanation(doc, sub, expl, add_header=True):
     """問題本文の後ろに、実番号で書式付きの解説ブロックを追加する。
     書式は社内フォーマット（前文1字下げ／選択肢ぶら下げ／解答は右揃え太字）に準拠。"""
@@ -334,19 +451,24 @@ def append_explanation(doc, sub, expl, add_header=True):
         if sub.get('subject'):
             p._p.append(make_run('（' + sub['subject'] + '）', font=GOTHIC))
 
-    # 前文（あれば）
-    前文 = expl.get('前文', '')
-    if 前文:
+    # 前文（あれば）。「●」区切りの列挙は各行に分割して見やすくする。
+    pre_lines = []
+    if expl.get('前文'):
+        pre_lines += split_bullets(expl['前文'])
+    for line in expl.get('前文_追加行', []):
+        if line:
+            pre_lines += split_bullets(line)
+    for line in pre_lines:
         p = doc.add_paragraph()
-        add_runs(p._p, parse_markup(前文))
+        add_runs(p._p, parse_markup(line))
         _set_ind(p, firstLineChars=100, firstLine=180)
-        for line in expl.get('前文_追加行', []):
-            if not line:
-                continue
-            p = doc.add_paragraph()
-            add_runs(p._p, parse_markup(line))
-            _set_ind(p, firstLineChars=100, firstLine=180)
-    doc.add_paragraph()  # 前文と選択肢の間の空行
+    if pre_lines:
+        doc.add_paragraph()  # 前文と選択肢の間の空行
+
+    # 構造式（あれば）：ラベル付き図版として前文の後に挿入
+    if expl.get('構造式'):
+        insert_structure_figure(doc, expl['構造式'])
+        doc.add_paragraph()
 
     # 選択肢解説（ぶら下げインデント）
     for item in expl.get('選択肢解説', []):
@@ -386,6 +508,7 @@ SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家�
 {
   "前文": "概念整理・公式・前提（純粋な知識問題で不要なら空文字）",
   "前文_追加行": ["前文が複数段落になる場合の2段落目", "3段落目"],
+  "構造式": [{"ラベル":"アミド", "smiles":"CC(=O)N"}],
   "選択肢解説": [
     {"番号":"１","正誤":"誤","内容":"解説文"},
     {"番号":"２","正誤":"正","内容":"解説文"},
@@ -425,7 +548,36 @@ SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家�
 - 投与間隔：τ
 - 平均滞留時間：MRT、平均吸収時間：MAT、平均溶出時間：MDT
 - 式番号：①②③…を用いて文中で相互参照
-- 単位：h、L、mg、h－1（上付き－1）など
+- 単位：h、L、mg など（h^{-1} のように指数はマークアップで表す）
+
+【上付き・下付き文字のルール（重要）】
+- 下付きは _{ } 、上付きは ^{ } で必ず明示する（LaTeX風）。地の文にそのまま数字を並べない。
+  例：初期濃度 A_{0}、半減期 t_{1/2}、定常状態 C_{ss}、最高濃度 C_{max}
+  例：指数・べき乗 e^{-kt}、1×10^{-5}、10^{6}、速度定数の単位 h^{-1}、面積 m^{2}
+- 化学式は、原子数を下付き、電荷を上付きで表す。
+  例：MnO_{4}^{-}、C_{2}O_{4}^{2-}、Mn^{2+}、CO_{2}、H^{+}、SO_{4}^{2-}、Ca^{2+}
+- 反応式もこの表記で書く。例：2MnO_{4}^{-}＋5C_{2}O_{4}^{2-}＋16H^{+}→2Mn^{2+}＋10CO_{2}＋8H_{2}O
+- 「1次反応」「2倍」など、数字が下付き・上付きでない箇所には付けない（通常の全角数字のまま）。
+
+【構造式（化学構造）の提示】
+- 有機化学・医薬品化学など、構造を示すと理解が深まる問題では "構造式" フィールドに
+  各分子を {"ラベル":"名称", "smiles":"SMILES文字列"} の形で列挙する。前文の後に図版として挿入される。
+- SMILESは正確なもののみ記載する（自信がない構造は載せない）。ラベルは日本語名や記号（A・B・C 等）でよい。
+  例）カルボン酸誘導体の反応性比較：
+  "構造式":[{"ラベル":"酸ハロゲン化物","smiles":"CC(=O)Cl"},{"ラベル":"酸無水物","smiles":"CC(=O)OC(C)=O"},
+           {"ラベル":"エステル","smiles":"CC(=O)OC"},{"ラベル":"カルボン酸","smiles":"CC(=O)O"},
+           {"ラベル":"アミド","smiles":"CC(=O)N"}]
+- 構造が不要な問題では "構造式" は省略（空配列でよい）。
+
+【複数の場合・種類を列挙するときのレイアウト】
+- 前文で複数の場合（例：0次反応・1次反応・2次反応、酸性/中性/塩基性 など）を提示するときは、
+  各項目を必ず「●」で始め、"前文_追加行" を使って1項目=1行に分けて記載する（1段落に詰め込まない）。
+  例）前文＝「反応次数ごとに速度式と半減期を整理する。」
+      前文_追加行＝[
+        "●0次反応：A＝A_{0}－kt。半減期 t_{1/2}＝A_{0}／(2k) で A_{0} に比例する。",
+        "●1次反応：A＝A_{0}e^{-kt}。半減期 t_{1/2}＝0.693／k で A_{0} によらず一定。",
+        "●2次反応：1／A＝1／A_{0}＋kt。半減期 t_{1/2}＝1／(k・A_{0}) で A_{0} に反比例する。"
+      ]
 
 【良い解説の例①：薬剤（薬物動態）知識問題（第110回 問173）】
 正解：３、５
@@ -463,9 +615,10 @@ SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家�
 選択肢４：「誤：選択肢３参照。」
 選択肢５：「正：メトクロプラミドはドパミンD2受容体遮断薬であり、D2受容体を遮断することでコリン作動性神経を興奮させGERを増大させる。そのため、メトクロプラミドを前投与した時の曲線は空腹時服用時と類似し、AよりBに近くなる。」
 
-マークアップ（数式・変数名に使用）:
-{{CL:r}}=CLr {{f:e}}=fe {{K:sp}}=Ksp {{t:1/2}}=t1/2 {{Vd}}=Vd
-{{mu}}=µ {{-}}=全角マイナス（－） {{sup:2}}=上付き2"""
+マークアップ:
+- 下付き _{...} / 上付き ^{...}（例：A_{0}、t_{1/2}、10^{-5}、MnO_{4}^{-}）
+- 特殊フォントの変数：{{CL:r}}=CLr {{f:e}}=fe {{K:sp}}=Ksp {{Vd}}=Vd {{mu}}=µ
+- ハイフン・マイナス（連結記号）は全角「－」を使用"""
 
 
 RENMON_INSTRUCTION = """
