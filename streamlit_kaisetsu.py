@@ -23,6 +23,7 @@ from docx.shared import Inches, Pt
 TNR      = 'Times New Roman'
 CENTURY  = 'Century'
 GOTHIC   = 'ＭＳ ゴシック'
+MINCHO   = 'ＭＳ 明朝'
 HIRAGINO = 'ヒラギノ角ゴ ProN W3'
 MARKUP   = re.compile(r'\{\{([^}]+)\}\}')
 NUMBERS  = ['１', '２', '３', '４', '５']
@@ -45,6 +46,12 @@ def normalize_dashes(text):
 TOKEN_RE = re.compile(r'(\{\{[^}]+\}\})|([_^])\{([^}]*)\}')
 
 
+def _fw_signs(text):
+    """上付き・下付き内のプラス・マイナスを全角（＋＝U+FF0B／－＝U+FF0D）にする。
+    全角記号はMS明朝（eastAsiaフォント）で描画され、社内フォーマットと字体が揃う。"""
+    return text.replace('-', '－').replace('−', '－').replace('+', '＋')
+
+
 def auto_scientific(text):
     """上付き・下付きが markup 化されていない一般的な理系表記を _{ }/^{ } に自動変換する
     （AIが markup を付け忘れた場合の保険）。"""
@@ -62,17 +69,17 @@ def _expand_curly(c):
     """{{...}} トークン1つ分を runs に展開する。"""
     if   c == '-':            return [{'text': '－'}]
     elif c == 'mu':           return [{'text': 'µ', 'font': CENTURY, 'italic': True}]
-    elif c.startswith('sup:'): return [{'text': c[4:], 'sup': True}]
-    elif c.startswith('sub:'): return [{'text': c[4:], 'sub': True}]
-    elif c.startswith('CL:'):  return [{'text':'CL','font':TNR,'italic':True},{'text':c[3:],'sub':True}]
+    elif c.startswith('sup:'): return [{'text': _fw_signs(c[4:]), 'sup': True, 'font': MINCHO}]
+    elif c.startswith('sub:'): return [{'text': _fw_signs(c[4:]), 'sub': True, 'font': MINCHO}]
+    elif c.startswith('CL:'):  return [{'text':'CL','font':TNR,'italic':True},{'text':_fw_signs(c[3:]),'sub':True}]
     elif c == 'CL':           return [{'text':'CL','font':TNR,'italic':True}]
-    elif c.startswith('f:'):   return [{'text':'f','font':CENTURY,'italic':True},{'text':c[2:],'sub':True}]
+    elif c.startswith('f:'):   return [{'text':'f','font':CENTURY,'italic':True},{'text':_fw_signs(c[2:]),'sub':True}]
     elif c == 'f':            return [{'text':'f','font':CENTURY,'italic':True}]
-    elif c.startswith('K:'):   return [{'text':'K','font':CENTURY,'italic':True},{'text':c[2:],'sub':True}]
-    elif c.startswith('t:'):   return [{'text':'t','font':CENTURY,'italic':True},{'text':c[2:],'sub':True}]
+    elif c.startswith('K:'):   return [{'text':'K','font':CENTURY,'italic':True},{'text':_fw_signs(c[2:]),'sub':True}]
+    elif c.startswith('t:'):   return [{'text':'t','font':CENTURY,'italic':True},{'text':_fw_signs(c[2:]),'sub':True}]
     elif 'Vd' in c:
         r = [{'text':'Vd','font':CENTURY,'italic':True}]
-        if ':' in c: r.append({'text':c.split(':',1)[1],'sub':True})
+        if ':' in c: r.append({'text':_fw_signs(c.split(':',1)[1]),'sub':True})
         return r
     return [{'text': c}]
 
@@ -87,7 +94,8 @@ def parse_markup(text):
             runs += _expand_curly(m.group(1)[2:-2])
         else:                                # _{...} / ^{...}
             kind, inner = m.group(2), m.group(3)
-            runs.append({'text': inner, 'sub': kind == '_', 'sup': kind == '^'})
+            runs.append({'text': _fw_signs(inner), 'sub': kind == '_',
+                         'sup': kind == '^', 'font': MINCHO})
         pos = m.end()
     if pos < len(text):
         runs.append({'text': normalize_dashes(text[pos:])})
