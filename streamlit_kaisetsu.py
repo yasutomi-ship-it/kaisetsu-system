@@ -511,6 +511,65 @@ def regenerate_explanations(doc, subs, boundary, expls):
         append_explanation(doc, sub, expl, add_header=add_header)
 
 
+# ──────────────────────────────────────────────
+# PDF（画像認識）モード：Word発PDFを読み、house形式のdocxを新規生成する
+# ──────────────────────────────────────────────
+def new_house_doc():
+    """社内フォーマットの既定スタイル（本文=Century/ＭＳ明朝 9pt）でDocumentを作る。"""
+    doc = Document()
+    stl = doc.styles['Normal']
+    stl.font.name = 'Century'
+    stl.font.size = Pt(9)
+    rpr = stl.element.get_or_add_rPr()
+    rf = rpr.find(qn('w:rFonts'))
+    if rf is None:
+        rf = OxmlElement('w:rFonts'); rpr.append(rf)
+    rf.set(qn('w:ascii'), 'Century')
+    rf.set(qn('w:hAnsi'), 'Century')
+    rf.set(qn('w:eastAsia'), MINCHO)
+    rf.set(qn('w:cs'), 'Times New Roman')
+    return doc
+
+
+def append_pdf_item(doc, item):
+    """PDF小問1つ分を、設問＋選択肢＋解説（構造式込み）としてdocxに追加する。"""
+    sub = {'num': str(item.get('問番号', '')), 'subject': item.get('科目')}
+    # 見出し（問番号＋科目、問番号をボールド）
+    p = doc.add_paragraph()
+    p._p.append(make_run('問', font=GOTHIC, bold=True))
+    p._p.append(make_run(sub['num'], font=GOTHIC, bold=True))
+    if sub['subject']:
+        p._p.append(make_run('（' + sub['subject'] + '）', font=GOTHIC))
+    # 設問文
+    stem = item.get('設問', '')
+    if stem:
+        ps = doc.add_paragraph()
+        add_runs(ps._p, parse_markup(stem))
+        _set_ind(ps, firstLineChars=100, firstLine=180)
+    # 選択肢
+    for i, ch in enumerate(item.get('選択肢', []) or []):
+        pc = doc.add_paragraph()
+        pc._p.append(make_run(NUMBERS[i] if i < len(NUMBERS) else str(i + 1), font=GOTHIC))
+        pc._p.append(make_run('　', font=HIRAGINO))
+        add_runs(pc._p, parse_markup(ch))
+        _set_ind(pc, leftChars=200, left=544, hangingChars=100, hanging=184)
+    # 解説（前文・構造式・選択肢解説・解答）。見出しは上で付けたので add_header=False
+    append_explanation(doc, sub, item, add_header=False)
+
+
+def build_from_pdf_result(result):
+    """PDF応答（{'小問':[...]}）から house形式の docx を生成する。"""
+    items = result.get('小問', []) or []
+    doc = new_house_doc()
+    if len(items) > 1:
+        nums = [str(it.get('問番号', '')) for it in items]
+        t = doc.add_paragraph()
+        t._p.append(make_run('問' + nums[0] + '〜' + nums[-1], font=GOTHIC, bold=True))
+    for it in items:
+        append_pdf_item(doc, it)
+    return doc, items
+
+
 SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家です。
 以下のJSON形式のみで回答してください（他のテキスト不要）:
 {
@@ -644,6 +703,33 @@ RENMON_INSTRUCTION = """
 - 「1つ選べ」の小問は解答を1つ、「2つ選べ」は2つ、という具合に設問の指示に従うこと。"""
 
 
+PDF_INSTRUCTION = """添付のPDFは薬剤師国家試験の問題です（図・グラフ・構造式を含むことがあります）。
+PDF内の図や構造式もよく見て内容を理解し、各小問の解説を作成してください。
+
+必ず次のJSON形式のみで回答してください（他のテキスト不要）:
+{
+  "小問": [
+    {
+      "問番号": "102",
+      "科目": "物理・化学・生物",
+      "設問": "設問文（〜はどれか。1つ選べ。 など）",
+      "選択肢": ["選択肢1の内容（構造なら化合物名）", "選択肢2の内容", "..."],
+      "前文": "概念整理・前提（不要なら空文字）",
+      "前文_追加行": [],
+      "構造式": [{"ラベル":"名称", "smiles":"SMILES"}],
+      "選択肢解説": [{"番号":"１","正誤":"誤","内容":"..."}, "..."],
+      "解答": ["４"]
+    }
+  ]
+}
+
+【重要】
+- PDFの図・構造式を実際に読み取り、選択肢と構造の対応・正誤を正確に判定すること（推測で番号を取り違えない）。
+- 連問（問196以降など複数小問）はPDF内の小問をすべて "小問" 配列に含め、前後の整合性を保つこと。
+- 構造が関わる問題は "構造式" に登場分子のSMILESを列挙する（解説に構造図として挿入される）。
+- 文体・記号（_{ }/^{ } の上付き下付き、全角ハイフン、●列挙など）は上記の共通ルールに従うこと。"""
+
+
 def _extract_json(text):
     depth, start = 0, None
     for i, ch in enumerate(text):
@@ -656,6 +742,19 @@ def _extract_json(text):
             if depth == 0 and start is not None:
                 return json.loads(text[start:i + 1])
     raise ValueError("JSONが見つかりません")
+
+
+def _post_api(payload, api_key):
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers={'Content-Type': 'application/json',
+                 'x-api-key': api_key,
+                 'anthropic-version': '2023-06-01'},
+        method='POST')
+    with urllib.request.urlopen(req, timeout=240) as resp:
+        text = json.loads(resp.read())['content'][0]['text']
+        return _extract_json(text)
 
 
 def call_api(question_text, api_key, sub_questions=None):
@@ -674,16 +773,25 @@ def call_api(question_text, api_key, sub_questions=None):
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": user_content}]
     }
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(payload).encode(),
-        headers={'Content-Type':'application/json',
-                 'x-api-key': api_key,
-                 'anthropic-version':'2023-06-01'},
-        method='POST')
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        text = json.loads(resp.read())['content'][0]['text']
-        return _extract_json(text)
+    return _post_api(payload, api_key)
+
+
+def call_api_pdf(pdf_bytes, api_key):
+    """PDF（Word発。図・構造式が描画済み）を画像認識APIに渡し、{'小問':[...]} を返す。"""
+    import base64
+    b64 = base64.b64encode(pdf_bytes).decode()
+    content = [
+        {"type": "document",
+         "source": {"type": "base64", "media_type": "application/pdf", "data": b64}},
+        {"type": "text", "text": PDF_INSTRUCTION},
+    ]
+    payload = {
+        "model": "claude-opus-4-8",
+        "max_tokens": 8192,
+        "system": SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": content}]
+    }
+    return _post_api(payload, api_key)
 
 
 # ──────────────────────────────────────────────
@@ -701,12 +809,17 @@ def main():
     st.divider()
 
     # ① ファイルアップロード
-    st.subheader('① テンプレートファイルをアップロード')
+    st.subheader('① ファイルをアップロード')
     uploaded = st.file_uploader(
-        'docxファイルをドラッグ＆ドロップ、またはクリックして選択',
-        type=['docx'],
-        help='問題と「ああああ」プレースホルダーが入ったテンプレートdocxファイル'
+        'docx（テンプレート）または PDF（図・構造式つき問題）をドラッグ＆ドロップ',
+        type=['docx', 'pdf'],
+        help='docx＝問題と「ああ」プレースホルダー入りテンプレート。'
+             'PDF＝Wordで「PDFとして書き出し」した問題（構造式・グラフが描画されているもの）。'
+             'PDFは画像認識で図を読み取り、解説Word（構造式つき）を新規生成します。'
     )
+    is_pdf = bool(uploaded) and uploaded.name.lower().endswith('.pdf')
+    if is_pdf:
+        st.info('📄 PDFモード：図・構造式を画像認識で読み取り、解説Wordを生成します（AIモードのみ）。')
 
     # ② モード
     st.subheader('② モードを選択')
@@ -765,6 +878,46 @@ def main():
 
         if 'AI' in mode and not api_key:
             st.error('APIキーを入力してください。')
+            st.stop()
+
+        # ===== PDFモード（画像認識）: 図・構造式を読み取り解説Wordを新規生成 =====
+        if is_pdf:
+            if '手動' in mode:
+                st.error('PDFモードはAIモードのみ対応です。上で「AIが自動生成」を選んでください。')
+                st.stop()
+            with st.spinner('PDFの図・構造式を読み取り、解説を生成中...（少し時間がかかります）'):
+                try:
+                    pdf_bytes = uploaded.read()
+                    result = call_api_pdf(pdf_bytes, api_key)
+                    out_doc, items = build_from_pdf_result(result)
+                    if not items:
+                        st.error('PDFから小問を読み取れませんでした。ファイルをご確認ください。')
+                        st.stop()
+
+                    buf = io.BytesIO()
+                    out_doc.save(buf)
+                    buf.seek(0)
+                    fname = uploaded.name.rsplit('.', 1)[0] + '_解説.docx'
+                    ans_str = ' ／ '.join(
+                        f"問{it.get('問番号', '')}: " + '、'.join(it.get('解答', []) or [])
+                        for it in items)
+                    n_struct = sum(len(it.get('構造式', []) or []) for it in items)
+                    st.success(f'✅ 完成！（解答 → {ans_str}）')
+                    if n_struct:
+                        st.caption(f'構造式データ {n_struct} 件を受信（RDKitで描画を試行しました）。')
+                    else:
+                        st.caption('（この問題ではAIから構造式データは出力されませんでした）')
+                    st.download_button(
+                        label='📥 解説Wordをダウンロード',
+                        data=buf,
+                        file_name=fname,
+                        mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                        use_container_width=True)
+                except urllib.error.HTTPError as e:
+                    st.error(f'APIエラー（{e.code}）: APIキー・PDF形式をご確認ください。')
+                except Exception as e:
+                    st.error(f'エラーが発生しました: {e}')
+                    st.exception(e)
             st.stop()
 
         if '手動' in mode:
