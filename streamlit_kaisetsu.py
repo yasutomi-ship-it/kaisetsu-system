@@ -501,6 +501,31 @@ def append_explanation(doc, sub, expl, add_header=True):
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
 
+def validate_expl(expl):
+    """AI応答の整合性チェック＆自動補正。
+    - "解答" と "選択肢解説" の 正/誤 が食い違う場合は "解答" 側に合わせる
+    - 全部"誤"（正が0件）などの破綻を検出して補正する
+    返り値: (補正後のexpl, 警告メッセージのリスト)
+    """
+    warns = []
+    items = expl.get('選択肢解説', []) or []
+    ans = [str(a).strip() for a in (expl.get('解答', []) or [])]
+    if not items:
+        return expl, warns
+    seis = [it.get('番号') for it in items if it.get('正誤') == '正']
+    if ans:
+        # 解答を正とし、選択肢解説の正誤を解答に合わせる
+        if set(seis) != set(ans):
+            warns.append(f'選択肢の正誤（正={seis or "なし"}）と解答（{ans}）が不一致のため、解答に合わせて補正しました。')
+            for it in items:
+                it['正誤'] = '正' if str(it.get('番号')).strip() in ans else '誤'
+    elif not seis:
+        warns.append('AIが正解を示しませんでした（全選択肢が誤）。解説内容をご確認ください。')
+    else:
+        expl['解答'] = seis
+    return expl, warns
+
+
 def regenerate_explanations(doc, subs, boundary, expls):
     """雛形を削除し、問題本文の後ろに実番号で解説を再生成する。
     連問（複数小問）のときだけ各解説ブロックに問番号ヘッダーを付ける
@@ -585,6 +610,13 @@ SYSTEM_PROMPT = """あなたは薬剤師国家試験の解説作成の専門家�
   ],
   "解答": ["２","５"]
 }
+
+【解答の整合性（最優先ルール）】
+- 正解は必ず選択肢の中に存在する。「どれも該当しない」は誤り。全選択肢を"誤"にしてはならない。
+- 「1つ選べ」は"正"がちょうど1つ、「2つ選べ」はちょうど2つ。
+  "解答"の個数と"選択肢解説"中の"正"の個数を必ず一致させること。
+- 最上位・最下位を問う問題（最も高い／最も低い など）は、提示された選択肢どうしを相対比較して
+  端の1つを選ぶ。選択肢に存在しない物質を基準に「該当しない」と判断してはならない。
 
 【文体・スタイルのルール】
 - 文末：「〜である。」「〜となる。」「〜と考えられる。」「〜と推定できる。」など断定調。「〜です」「〜ます」は使わない。
@@ -808,10 +840,22 @@ PDF_EXPLAIN_INSTRUCTION = """添付PDFはこの問題（図・グラフ・構造
 }}
 対象の小問（この順序・この問番号で出力）: {targets}
 
+【重要：解答は必ず選択肢の中から選ぶ（最優先ルール）】
+- 正解は必ず提示された選択肢の中に存在する。「どれも該当しない」という解説は誤りである。
+- 設問が「1つ選べ」なら "正" はちょうど1つ、"2つ選べ" ならちょうど2つにすること。
+  "解答" の個数と、"選択肢解説" 中の "正" の個数は必ず一致させること（全部"誤"は禁止）。
+- 比較は「実際に提示された選択肢どうし」で行うこと。選択肢に無い化合物（例：アミドが無いのに
+  アミドを持ち出す）を基準に「該当しない」と結論づけてはならない。
+  → 一般論の序列を思い出すのではなく、"この5つの中で相対的にどれが最も○○か" を判断する。
+- 手順：(1)各選択肢の構造を同定 →(2)設問の指標で順位付け →(3)端（最大/最小）の1つを"正"とする
+  →(4)残りを"誤"とし、"正"より上位/下位である理由を書く →(5)"解答"に"正"の番号を入れる。
+
 【重要】
 - PDFの図・構造式を実際に読み取り、選択肢と構造の対応・正誤を正確に判定すること。
   （例：O−アシルイソ尿素・混合酸無水物などの活性化アシル種は反応性が高い。求核アシル置換の
-   反応性序列＝酸ハロゲン化物＞酸無水物・活性エステル＞エステル＞アミド を丁寧に当てはめる。）
+   反応性序列＝酸ハロゲン化物＞酸無水物・活性エステル＞エステル＞アミド を丁寧に当てはめる。
+   活性エステル（フェニルエステル等）は通常のアルキルエステルより反応性が高いので、
+   両者が並ぶ場合は通常のアルキルエステルの方が反応性が低い。）
 - "構造式" には「解説で新たに図示すべき構造」だけをSMILESで入れる
   （反応の生成物・活性体・代謝物・中間体など）。問題に既に描かれている構造は入れない。
   新規構造が不要なら "構造式" は空配列でよい。
@@ -944,6 +988,10 @@ def main():
                 try:
                     pdf_bytes = uploaded.read()
                     result = call_api_pdf(pdf_bytes, api_key)
+                    for it in (result.get('小問', []) or []):
+                        _, ws = validate_expl(it)
+                        for w in ws:
+                            st.warning(f"問{it.get('問番号','')}: {w}")
                     out_doc, items = build_from_pdf_result(result)
                     if not items:
                         st.error('PDFから小問を読み取れませんでした。ファイルをご確認ください。')
@@ -999,6 +1047,9 @@ def main():
                         it = by_num.get(str(s['num']))
                         if it is None:
                             it = items[i] if i < len(items) else {}
+                        it, ws = validate_expl(it)
+                        for w in ws:
+                            st.warning(f"問{s['num']}: {w}")
                         expls.append(it)
 
                     regenerate_explanations(doc, subs, boundary, expls)
@@ -1094,6 +1145,10 @@ def main():
                             expls.append(it)
                     else:
                         expls = [result]
+                    for s, e in zip(subs, expls):
+                        _, ws = validate_expl(e)
+                        for w in ws:
+                            st.warning(f"問{s['num']}: {w}")
                 else:
                     if is_renmon:
                         st.error('連問は手動入力に未対応です。AIモードをご利用ください。')
