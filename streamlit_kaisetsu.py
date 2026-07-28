@@ -794,6 +794,51 @@ def call_api_pdf(pdf_bytes, api_key):
     return _post_api(payload, api_key)
 
 
+PDF_EXPLAIN_INSTRUCTION = """添付PDFはこの問題（図・グラフ・構造式を含むことがある）です。
+図・構造式もよく見て理解し、次の各小問について「解説だけ」をJSONで返してください。
+設問文・選択肢の再掲は不要です（それらは別のWordテンプレート側にあります）。
+
+必ず次のJSON形式のみで回答（他のテキスト不要）:
+{{
+  "小問": [
+    {{"問番号":"{first}", "前文":"...", "前文_追加行":[],
+      "構造式":[{{"ラベル":"名称","smiles":"SMILES"}}],
+      "選択肢解説":[{{"番号":"１","正誤":"誤","内容":"..."}}, "..."], "解答":["４"]}}
+  ]
+}}
+対象の小問（この順序・この問番号で出力）: {targets}
+
+【重要】
+- PDFの図・構造式を実際に読み取り、選択肢と構造の対応・正誤を正確に判定すること。
+  （例：O−アシルイソ尿素・混合酸無水物などの活性化アシル種は反応性が高い。求核アシル置換の
+   反応性序列＝酸ハロゲン化物＞酸無水物・活性エステル＞エステル＞アミド を丁寧に当てはめる。）
+- "構造式" には「解説で新たに図示すべき構造」だけをSMILESで入れる
+  （反応の生成物・活性体・代謝物・中間体など）。問題に既に描かれている構造は入れない。
+  新規構造が不要なら "構造式" は空配列でよい。
+- 文体・記号（下付き _{{ }}／上付き ^{{ }}、全角ハイフン、●列挙）は共通ルールに従う。"""
+
+
+def call_api_pdf_explain(pdf_bytes, api_key, subs):
+    """PDF（図・構造式つき）を見せて、docxの各小問に対応する「解説だけ」を {'小問':[...]} で返す。"""
+    import base64
+    b64 = base64.b64encode(pdf_bytes).decode()
+    targets = "、".join(
+        f"問{s['num']}（{s.get('subject') or ''}・選択肢{s.get('n_choices', 5)}）" for s in subs)
+    instr = PDF_EXPLAIN_INSTRUCTION.format(first=subs[0]['num'], targets=targets)
+    content = [
+        {"type": "document",
+         "source": {"type": "base64", "media_type": "application/pdf", "data": b64}},
+        {"type": "text", "text": instr},
+    ]
+    payload = {
+        "model": "claude-opus-4-8",
+        "max_tokens": 8192,
+        "system": SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": content}]
+    }
+    return _post_api(payload, api_key)
+
+
 # ──────────────────────────────────────────────
 # Streamlit UI
 # ──────────────────────────────────────────────
@@ -818,8 +863,18 @@ def main():
              'PDFは画像認識で図を読み取り、解説Word（構造式つき）を新規生成します。'
     )
     is_pdf = bool(uploaded) and uploaded.name.lower().endswith('.pdf')
+    is_docx = bool(uploaded) and uploaded.name.lower().endswith('.docx')
+    vision_pdf = None
     if is_pdf:
-        st.info('📄 PDFモード：図・構造式を画像認識で読み取り、解説Wordを生成します（AIモードのみ）。')
+        st.info('📄 PDF単体モード：図・構造式を画像認識で読み取り、解説Wordを新規生成します（AIモードのみ）。')
+    if is_docx:
+        vision_pdf = st.file_uploader(
+            '（任意）構造式・グラフのある問題は、その問題のPDF（Wordで「PDF書き出し」したもの）も添付',
+            type=['pdf'], key='vision_pdf',
+            help='PDFを添付すると、AIが図・構造式を実際に見て解説を書きます。'
+                 '出力はこのdocx原本のまま（問題・構造・体裁は保持）、解説だけ差し込みます。')
+        if vision_pdf is not None:
+            st.info('🖼️ docx＋PDFモード：docx原本はそのまま、AIがPDFの図を見て解説を差し込みます。')
 
     # ② モード
     st.subheader('② モードを選択')
@@ -909,6 +964,58 @@ def main():
                         st.caption('（この問題ではAIから構造式データは出力されませんでした）')
                     st.download_button(
                         label='📥 解説Wordをダウンロード',
+                        data=buf,
+                        file_name=fname,
+                        mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                        use_container_width=True)
+                except urllib.error.HTTPError as e:
+                    st.error(f'APIエラー（{e.code}）: APIキー・PDF形式をご確認ください。')
+                except Exception as e:
+                    st.error(f'エラーが発生しました: {e}')
+                    st.exception(e)
+            st.stop()
+
+        # ===== docx＋PDFモード：docx原本はそのまま、PDFで図を見て解説を差し込む =====
+        if is_docx and vision_pdf is not None:
+            if '手動' in mode:
+                st.error('docx＋PDFモードはAIモードのみ対応です。')
+                st.stop()
+            with st.spinner('PDFの図・構造式を読み取り、docx原本に解説を差し込み中...'):
+                try:
+                    doc = Document(io.BytesIO(uploaded.read()))
+                    subs, boundary = parse_question_blocks(doc)
+                    if not subs:
+                        st.error('docxの問題文から小問（問◯◯）を検出できませんでした。')
+                        st.stop()
+                    st.info('・'.join(f"問{s['num']}" for s in subs) + ' を検出。PDFの図を読み取り中...')
+
+                    result = call_api_pdf_explain(vision_pdf.read(), api_key, subs)
+                    items = result.get('小問', []) if isinstance(result, dict) else []
+                    if not items:
+                        raise ValueError('PDFから解説（小問配列）が得られませんでした。')
+                    by_num = {str(it.get('問番号')): it for it in items}
+                    expls = []
+                    for i, s in enumerate(subs):
+                        it = by_num.get(str(s['num']))
+                        if it is None:
+                            it = items[i] if i < len(items) else {}
+                        expls.append(it)
+
+                    regenerate_explanations(doc, subs, boundary, expls)
+
+                    buf = io.BytesIO()
+                    doc.save(buf)
+                    buf.seek(0)
+                    fname = uploaded.name.replace('.docx', '_完成.docx')
+                    ans_str = ' ／ '.join(
+                        f"問{s['num']}: " + '、'.join(e.get('解答', []) or [])
+                        for s, e in zip(subs, expls))
+                    n_struct = sum(len(e.get('構造式', []) or []) for e in expls)
+                    st.success(f'✅ 完成！（解答 → {ans_str}）')
+                    if n_struct:
+                        st.caption(f'新規構造式データ {n_struct} 件を受信（RDKitで描画を試行しました）。')
+                    st.download_button(
+                        label='📥 完成ファイルをダウンロード',
                         data=buf,
                         file_name=fname,
                         mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
